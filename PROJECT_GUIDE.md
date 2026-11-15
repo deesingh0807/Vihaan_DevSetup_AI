@@ -414,7 +414,17 @@ npm start
 
 1. Open **Local Companion**.
 2. Download `devsetup-companion.ps1`.
-3. Run it in PowerShell on Windows.
+3. In Windows PowerShell 5.1, change to the download folder and run:
+
+```powershell
+cd "$HOME\Downloads"
+powershell.exe -ExecutionPolicy Bypass -File ".\devsetup-companion.ps1"
+```
+
+If PowerShell says the file does not exist, replace `$HOME\Downloads` with the
+folder that actually contains the downloaded script. The `-File` path is relative
+to the current PowerShell folder.
+
 4. Keep the companion terminal open.
 5. Return to the website.
 6. Click **Scan Local Machine**.

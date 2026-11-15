@@ -134,15 +134,15 @@ export const CompanionView: React.FC<CompanionViewProps> = ({
           </div>
 
           <div className="rounded-lg bg-slate-50 border border-slate-200 p-3 text-xs space-y-1">
-            <div className="font-medium text-slate-700">Run in PowerShell:</div>
-            <code className="block font-mono text-slate-900">
-              powershell -ExecutionPolicy Bypass -File .\devsetup-companion.ps1
-            </code>
+          <div className="font-medium text-slate-700">Run in Windows PowerShell 5.1:</div>
+          <code className="block whitespace-pre-wrap font-mono text-slate-900">
+            cd "$HOME\Downloads"{'\n'}powershell.exe -ExecutionPolicy Bypass -File ".\devsetup-companion.ps1"
+          </code>
             <div className="pt-2 text-slate-600">
-              1. Open PowerShell in the folder where you downloaded the script.
-              2. Run the command above.
-              3. Copy the value after <code className="font-mono">Companion session token:</code> from that same window.
-              4. Paste it below and keep the PowerShell window open.
+            If the file was saved somewhere else, replace <code className="font-mono">$HOME\Downloads</code> with that folder. You can also right-click the downloaded file, choose <strong>Properties</strong>, copy its folder location, and run <code className="font-mono">cd "that-folder"</code> first.
+          </div>
+          <div className="pt-1 text-slate-600">
+            Copy the value after <code className="font-mono">Companion session token:</code> from that window and keep PowerShell open.
             </div>
           </div>
           <label className="block text-xs text-slate-600">
