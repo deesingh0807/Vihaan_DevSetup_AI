@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Check,
   Camera,
@@ -60,6 +60,7 @@ export const SetupAgentView: React.FC<SetupAgentViewProps> = ({
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [runningStep, setRunningStep] = useState<number | null>(null);
   const [stepOutputs, setStepOutputs] = useState<Record<number, { success: boolean; output: string }>>({});
+  const autoFixAttempts = useRef<Record<number, number>>({});
 
   React.useEffect(() => {
     if (result) localStorage.setItem('devsetup_active_analysis', JSON.stringify(result));
@@ -195,13 +196,43 @@ export const SetupAgentView: React.FC<SetupAgentViewProps> = ({
     try {
       const res = await fetch('http://127.0.0.1:4789/execute', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Companion-Token': localStorage.getItem('devsetup_companion_token') || '',
+        },
         body: JSON.stringify({ command }),
       });
       const data = await res.json();
+      let output = data.output || 'Done.';
+      if (!data.success) {
+        const attempt = autoFixAttempts.current[stepNumber] || 0;
+        if (attempt < 3) {
+          const diagnosisResponse = await fetch('/api/agent/troubleshoot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ errorOutput: output, context: `Setup step: ${command}` }),
+          });
+          if (diagnosisResponse.ok) {
+            const diagnosis = await diagnosisResponse.json();
+            const proposed = diagnosis.proposedCommands?.find(
+              (item: { command?: string }) => item.command
+            );
+            if (proposed?.command && window.confirm(
+              `The command failed. Apply this suggested fix? (Attempt ${attempt + 1} of 3)\n\n${proposed.command}`
+            )) {
+              autoFixAttempts.current[stepNumber] = attempt + 1;
+              await executeStepOnCompanion(stepNumber, proposed.command);
+              return;
+            }
+            output = `${output}\n\nSuggested fix: ${diagnosis.recommendedFix || 'Review the Troubleshooter tab.'}`;
+          }
+        }
+      } else {
+        delete autoFixAttempts.current[stepNumber];
+      }
       setStepOutputs((prev) => ({
         ...prev,
-        [stepNumber]: { success: Boolean(data.success), output: data.output || 'Done.' },
+        [stepNumber]: { success: Boolean(data.success), output },
       }));
       if (data.success && result) {
         setResult({
@@ -210,7 +241,9 @@ export const SetupAgentView: React.FC<SetupAgentViewProps> = ({
             s.stepNumber === stepNumber ? { ...s, approved: true, completed: true } : s
           ),
         });
-        const scanResponse = await fetch('http://127.0.0.1:4789/scan');
+        const scanResponse = await fetch('http://127.0.0.1:4789/scan', {
+          headers: { 'X-Companion-Token': localStorage.getItem('devsetup_companion_token') || '' },
+        });
         if (scanResponse.ok) onScanLoaded(await scanResponse.json());
       }
     } catch {

@@ -426,17 +426,8 @@ The companion listens only on:
 http://127.0.0.1:4789
 ```
 
-The server blocks several dangerous command patterns, including:
-
-- Recursive delete commands
-- Disk formatting
-- `diskpart`
-- Shutdown/restart
-- Registry deletion
-- `Invoke-Expression`
-- `iex`
-- `mkfs`
-- `dd`
+The companion uses a positive executable allowlist and rejects shell control
+characters. Commands outside the catalog-backed setup flow are not executed.
 
 The safety guard is not a replacement for human review. Always inspect generated commands before approval.
 
@@ -618,3 +609,11 @@ DevSetup AI combines:
 - Assignment-aware code generation.
 
 The most important operating principle is: **the AI recommends, the student approves, and the local companion executes while the application records the result.**
+
+## 17. Secure Local Companion
+
+The downloaded PowerShell companion creates a random session token at startup and prints it only in the local console. Paste that token into the Companion screen; browser requests then send it in `X-Companion-Token`. The companion accepts only the app's localhost origins, prompts for approval in the laptop console, rejects shell control characters, and runs only allowlisted developer executables without `Invoke-Expression`.
+
+Every approval, command, and result is appended to the local `devsetup-activity.log` file. The file is intentionally ignored by Git because it can contain local paths and commands. Failed setup commands can be sent to the troubleshooting API for up to three approved fix attempts.
+
+Generated setup scripts never trust AI-provided install commands. The server replaces them with commands from `src/data/knowledgeBase.ts`; unknown software is reported for manual installation instead of being executed automatically.

@@ -1,19 +1,10 @@
-import React, { useEffect, useState } from 'react';
-import { Check, Copy, Download, Link2, RefreshCw, Unlink, Upload } from 'lucide-react';
+import React, { useState } from 'react';
+import { Check, Copy, Download, RefreshCw, Upload } from 'lucide-react';
 import { LocalEnvironmentScan } from '../types/devsetup';
 
 interface CompanionViewProps {
   localScan: LocalEnvironmentScan | null;
   onScanLoaded: (scan: LocalEnvironmentScan) => void;
-}
-
-interface NonilionStatus {
-  connected: boolean;
-  botName: string;
-  room: string | null;
-  lastPollAt: string | null;
-  messagesHandled: number;
-  lastError: string | null;
 }
 
 export const CompanionView: React.FC<CompanionViewProps> = ({
@@ -23,66 +14,13 @@ export const CompanionView: React.FC<CompanionViewProps> = ({
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
-  const [pairCode, setPairCode] = useState('');
-  const [pairing, setPairing] = useState(false);
-  const [pairError, setPairError] = useState<string | null>(null);
-  const [nonilionStatus, setNonilionStatus] = useState<NonilionStatus | null>(null);
+  const [companionToken, setCompanionToken] = useState(
+    () => localStorage.getItem('devsetup_companion_token') || ''
+  );
 
-  const fetchNonilionStatus = async () => {
-    try {
-      const res = await fetch('/api/nonilion/status');
-      const ct = res.headers.get('content-type') || '';
-      if (res.ok && ct.includes('application/json')) {
-        setNonilionStatus(await res.json());
-      }
-    } catch {
-      // ignore status check error
-    }
-  };
-
-  useEffect(() => {
-    fetchNonilionStatus();
-    const timer = setInterval(fetchNonilionStatus, 5000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const handlePairNonilion = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!pairCode.trim()) return;
-    setPairing(true);
-    setPairError(null);
-    try {
-      const res = await fetch('/api/nonilion/pair', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: pairCode.trim() }),
-      });
-      const rawText = await res.text();
-      let data: any;
-      try {
-        data = JSON.parse(rawText);
-      } catch {
-        throw new Error(
-          rawText.trim().startsWith('<')
-            ? 'The server returned HTML instead of JSON. Please refresh the page or redeploy.'
-            : `Unexpected response (${res.status}).`
-        );
-      }
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || 'Pairing failed.');
-      }
-      setPairCode('');
-      await fetchNonilionStatus();
-    } catch (err) {
-      setPairError(err instanceof Error ? err.message : 'Pairing failed.');
-    } finally {
-      setPairing(false);
-    }
-  };
-
-  const handleDisconnectNonilion = async () => {
-    await fetch('/api/nonilion/disconnect', { method: 'POST' });
-    await fetchNonilionStatus();
+  const saveCompanionToken = (value: string) => {
+    setCompanionToken(value);
+    localStorage.setItem('devsetup_companion_token', value.trim());
   };
 
   const handleConnectLive = async () => {
@@ -90,7 +28,9 @@ export const CompanionView: React.FC<CompanionViewProps> = ({
     setError(null);
     setSuccessMsg(null);
     try {
-      const res = await fetch('http://127.0.0.1:4789/scan');
+      const res = await fetch('http://127.0.0.1:4789/scan', {
+        headers: { 'X-Companion-Token': companionToken.trim() },
+      });
       if (!res.ok) throw new Error('Companion returned an error.');
       const data = (await res.json()) as LocalEnvironmentScan;
       onScanLoaded(data);
@@ -195,6 +135,16 @@ export const CompanionView: React.FC<CompanionViewProps> = ({
               powershell -ExecutionPolicy Bypass -File .\devsetup-companion.ps1
             </code>
           </div>
+          <label className="block text-xs text-slate-600">
+            Companion token (printed in the PowerShell window)
+            <input
+              type="password"
+              value={companionToken}
+              onChange={(e) => saveCompanionToken(e.target.value)}
+              placeholder="Paste the session token"
+              className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-900 focus:border-blue-600 focus:outline-none"
+            />
+          </label>
         </div>
 
         <div className="rounded-xl border border-slate-200 bg-white p-5 space-y-4">
@@ -251,76 +201,8 @@ export const CompanionView: React.FC<CompanionViewProps> = ({
         </div>
       </div>
 
-      {/* Direct Nonilion.com Pairing Bridge */}
-      <div className="rounded-xl border border-slate-200 bg-white p-5 space-y-4">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <h2 className="text-base font-semibold text-slate-900">
-              Nonilion.com Direct Bridge (Pairing Code)
-            </h2>
-            <p className="text-xs text-slate-600">
-              Connect this AI Studio app directly to your Nonilion virtual office without Render or public webhooks. Click <strong>Use a pairing code instead</strong> in Nonilion and paste the 6-character code here.
-            </p>
-          </div>
-          {nonilionStatus?.connected && (
-            <button
-              type="button"
-              onClick={handleDisconnectNonilion}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 shrink-0"
-            >
-              <Unlink className="w-3.5 h-3.5" />
-              Disconnect
-            </button>
-          )}
-        </div>
-
-        {nonilionStatus?.connected ? (
-          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3.5 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between text-xs text-emerald-900">
-            <div className="flex items-center gap-2 font-medium">
-              <Check className="w-4 h-4 text-emerald-700 shrink-0" />
-              <span>
-                Connected to Nonilion as {nonilionStatus.botName}
-                {nonilionStatus.room ? ` (${nonilionStatus.room})` : ''}
-              </span>
-            </div>
-            <div className="tabular-nums text-emerald-800">
-              {nonilionStatus.messagesHandled} messages answered
-              {nonilionStatus.lastPollAt
-                ? ` · Last checked ${new Date(nonilionStatus.lastPollAt).toLocaleTimeString()}`
-                : ''}
-            </div>
-          </div>
-        ) : (
-          <form onSubmit={handlePairNonilion} className="flex flex-wrap items-center gap-3">
-            <input
-              type="text"
-              value={pairCode}
-              onChange={(e) => setPairCode(e.target.value)}
-              placeholder="Enter pairing code (e.g. A45-EHM)"
-              className="rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-mono uppercase text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:outline-none w-56"
-            />
-            <button
-              type="submit"
-              disabled={pairing || !pairCode.trim()}
-              className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-4 py-2 text-xs font-medium text-white hover:bg-slate-800 disabled:opacity-50 transition-colors"
-            >
-              <Link2 className="w-3.5 h-3.5" />
-              {pairing ? 'Pairing...' : 'Pair with Nonilion'}
-            </button>
-          </form>
-        )}
-
-        {pairError && (
-          <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-800">
-            {pairError}
-          </div>
-        )}
-
-        {nonilionStatus?.lastError && (
-          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
-            Poller notice: {nonilionStatus.lastError}
-          </div>
-        )}
+      <div className="rounded-xl border border-blue-200 bg-blue-50 p-5 text-xs text-blue-900">
+        <strong>Secure companion:</strong> every command is token-authenticated, shown in the PowerShell console for approval, restricted to approved executables, and recorded locally in <code>devsetup-activity.log</code>.
       </div>
     </div>
   );

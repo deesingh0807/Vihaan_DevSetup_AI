@@ -53,6 +53,43 @@ function parseGeneratedJson(text: string | undefined) {
   }
 }
 
+function findCatalogItem(name: unknown) {
+  if (typeof name !== 'string') return undefined;
+  const normalized = name.trim().toLowerCase();
+  return SOFTWARE_KNOWLEDGE_BASE.find(
+    (item) =>
+      item.name.toLowerCase() === normalized ||
+      item.id.toLowerCase() === normalized ||
+      normalized.includes(item.name.toLowerCase()) ||
+      item.name.toLowerCase().includes(normalized)
+  );
+}
+
+function sanitizeScanForAi(scan: unknown) {
+  if (!scan || typeof scan !== 'object') return scan;
+  const value = scan as Record<string, unknown>;
+  return {
+    os: value.os,
+    osVersion: value.osVersion,
+    architecture: value.architecture,
+    packageManagers: value.packageManagers,
+    tools: Array.isArray(value.tools)
+      ? value.tools.map((tool) => {
+          if (!tool || typeof tool !== 'object') return tool;
+          const item = tool as Record<string, unknown>;
+          return {
+            name: item.name,
+            installed: item.installed,
+            version: item.version,
+            status: item.status,
+          };
+        })
+      : [],
+    vscodeExtensions: value.vscodeExtensions,
+    envVars: value.envVars,
+  };
+}
+
 function toPruneMessages(contents: unknown, systemInstruction?: unknown) {
   const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: unknown }> = [];
   if (typeof systemInstruction === 'string' && systemInstruction) {
@@ -172,6 +209,15 @@ const WINDOWS_COMPANION_PS1 = `# DevSetup AI - Local Companion Agent (Windows 10
 # Also outputs devsetup-scan.json in the current directory.
 
 $ErrorActionPreference = "SilentlyContinue"
+$companionToken = [guid]::NewGuid().ToString("N")
+$allowedOrigins = @("http://127.0.0.1:3000", "http://localhost:3000")
+$activityPath = Join-Path (Get-Location) "devsetup-activity.log"
+Write-Host "Companion session token: $companionToken" -ForegroundColor Magenta
+Write-Host "Paste this token into DevSetup AI before connecting." -ForegroundColor Yellow
+
+function Write-Activity($event) {
+    Add-Content -Path $activityPath -Value ("{0} {1}" -f (Get-Date).ToString("o"), $event)
+}
 
 function Get-CmdVersion($cmd, $argsList) {
     $found = Get-Command $cmd -ErrorAction SilentlyContinue
@@ -263,12 +309,27 @@ while ($listener.IsListening) {
     $context = $listener.GetContext()
     $request = $context.Request
     $response = $context.Response
-    $response.Headers.Add("Access-Control-Allow-Origin", "*")
     $response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    $response.Headers.Add("Access-Control-Allow-Headers", "Content-Type")
+    $response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, X-Companion-Token")
     $response.Headers.Add("Content-Type", "application/json")
+    $origin = $request.Headers["Origin"]
+    if ($origin -and ($allowedOrigins -notcontains $origin)) {
+        $response.StatusCode = 403
+        $response.Close()
+        continue
+    }
+    if ($origin) {
+        $response.Headers.Add("Access-Control-Allow-Origin", $origin)
+        $response.Headers.Add("Vary", "Origin")
+    }
     if ($request.HttpMethod -eq "OPTIONS") {
         $response.StatusCode = 204
+        $response.Close()
+        continue
+    }
+    $protectedPath = @("/execute", "/scan", "/activity") -contains $request.Url.AbsolutePath
+    if ($protectedPath -and $request.Headers["X-Companion-Token"] -ne $companionToken) {
+        $response.StatusCode = 401
         $response.Close()
         continue
     }
@@ -276,9 +337,10 @@ while ($listener.IsListening) {
         $reader = New-Object System.IO.StreamReader($request.InputStream, $request.ContentEncoding)
         $body = $reader.ReadToEnd() | ConvertFrom-Json
         $cmd = "$($body.command)"
-        $blocked = '(?i)(rm\s+-rf|del\s+/[sq]|format\s+[a-z]:|diskpart|reg\s+delete|shutdown|restart-computer|remove-item.*-recurse|iex\s*\(|invoke-expression|\|\s*iex|mkfs|dd\s+if=)'
-        if ($cmd -match $blocked) {
-            $resObj = @{ success = $false; output = "Blocked potentially harmful command by DevSetup AI Safety Guardrail."; exitCode = 403 } | ConvertTo-Json
+        $approval = Read-Host "Approve this command on this PC? (y/N) $cmd"
+        Write-Activity("approval=$approval command=$cmd")
+        if ($approval -notmatch '^(?i)y(es)?$') {
+            $resObj = @{ success = $false; output = "Command rejected at the companion console."; exitCode = 403 } | ConvertTo-Json
             $buffer = [System.Text.Encoding]::UTF8.GetBytes($resObj)
             $response.ContentLength64 = $buffer.Length
             $response.OutputStream.Write($buffer, 0, $buffer.Length)
@@ -288,9 +350,20 @@ while ($listener.IsListening) {
         $env:PATH | Out-File -FilePath "devsetup-path-backup.txt" -Encoding utf8
         Write-Host "Executing approved command: $cmd" -ForegroundColor Cyan
         try {
-            $out = Invoke-Expression $cmd 2>&1 | Out-String
+            if ($cmd -match '(?i)[;&|<>\`$()]') {
+                throw "Command contains shell control characters and was blocked."
+            }
+            $parts = [regex]::Matches($cmd, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') }
+            $allowedExecutables = @("winget", "pip", "npm", "node", "python", "python3", "gcc", "g++", "javac", "java", "docker", "mysql", "code", "cmake", "mvn")
+            if ($parts.Count -lt 1 -or $allowedExecutables -notcontains $parts[0].ToLowerInvariant()) {
+                throw "Executable is not in the DevSetup allowlist."
+            }
+            $commandArgs = if ($parts.Count -gt 1) { @($parts[1..($parts.Count - 1)]) } else { @() }
+            $out = & $parts[0] @commandArgs 2>&1 | Out-String
+            Write-Activity("result=success command=$cmd")
             $resObj = @{ success = $true; output = $out.Trim(); exitCode = 0 } | ConvertTo-Json
         } catch {
+            Write-Activity("result=failure command=$cmd error=$($_.Exception.Message)")
             $resObj = @{ success = $false; output = $_.Exception.Message; exitCode = 1 } | ConvertTo-Json
         }
         $buffer = [System.Text.Encoding]::UTF8.GetBytes($resObj)
@@ -298,6 +371,10 @@ while ($listener.IsListening) {
         $response.OutputStream.Write($buffer, 0, $buffer.Length)
         $response.Close()
         continue
+    }
+    if ($request.HttpMethod -eq "GET" -and $request.Url.AbsolutePath -eq "/activity") {
+        $activity = if (Test-Path $activityPath) { Get-Content $activityPath | Select-Object -Last 100 } else { @() }
+        $json = @{ entries = @($activity) } | ConvertTo-Json -Depth 4
     }
     if ($request.HttpMethod -eq "GET" -and $request.Url.AbsolutePath -eq "/scan") {
         $json = Get-ScanJson
@@ -358,7 +435,9 @@ ${kbSummary}`;
     const userContent = [
       `Student Request: ${prompt}`,
       assignmentText ? `Uploaded Assignment / Project Document:\n${assignmentText}` : '',
-      localScan ? `Actual Local Environment Scan:\n${JSON.stringify(localScan)}` : 'Local Environment Scan: Not yet connected.',
+      localScan
+        ? `Actual Local Environment Scan (privacy-filtered):\n${JSON.stringify(sanitizeScanForAi(localScan))}`
+        : 'Local Environment Scan: Not yet connected.',
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -481,6 +560,18 @@ ${kbSummary}`;
     });
 
     const parsed = parseGeneratedJson(response.text);
+    if (Array.isArray(parsed.requirements)) {
+      parsed.requirements = parsed.requirements.map((requirement: Record<string, unknown>) => {
+        const catalogItem = findCatalogItem(requirement.name);
+        return {
+          ...requirement,
+          installCommand: catalogItem?.installCommand || '',
+          verifyCommand: catalogItem?.verifyCommand || '',
+          officialUrl: catalogItem?.officialUrl || '',
+          uninstallCommand: '',
+        };
+      });
+    }
     if (Array.isArray(parsed.setupPlan)) {
       parsed.setupPlan = parsed.setupPlan.map((step: Record<string, unknown>) => ({
         ...step,
@@ -656,19 +747,6 @@ app.get('/api/usage', (_req, res) => {
   });
 });
 
-app.get('/api/nonilion/webhook', (_req, res) => {
-  res.json({
-    ok: true,
-    status: 'ready',
-    agent: 'DevSetup AI',
-    message: 'DevSetup AI Nonilion webhook is online.',
-  });
-});
-
-app.get('/webhook', (_req, res) => {
-  res.json({ ok: true, status: 'ready', agent: 'DevSetup AI' });
-});
-
 function buildKbFallbackReply(userMessage: string): string {
   const lower = userMessage.toLowerCase();
   const matches = SOFTWARE_KNOWLEDGE_BASE.filter(
@@ -691,12 +769,12 @@ function buildKbFallbackReply(userMessage: string): string {
 }
 
 // --- Synced Local Scan & Generated Setup Artifacts ---
-const NONILION_SCAN_FILE = path.resolve(process.cwd(), '.nonilion-scan.json');
+const DEVSETUP_SCAN_FILE = path.resolve(process.cwd(), '.devsetup-scan.json');
 let latestSyncedScan: Record<string, unknown> | null = null;
 
 try {
-  if (fs.existsSync(NONILION_SCAN_FILE)) {
-    latestSyncedScan = JSON.parse(fs.readFileSync(NONILION_SCAN_FILE, 'utf8'));
+  if (fs.existsSync(DEVSETUP_SCAN_FILE)) {
+    latestSyncedScan = JSON.parse(fs.readFileSync(DEVSETUP_SCAN_FILE, 'utf8'));
   }
 } catch {
   latestSyncedScan = null;
@@ -712,7 +790,7 @@ app.post('/api/companion/sync-scan', (req, res) => {
   }
   latestSyncedScan = scan as Record<string, unknown>;
   try {
-    fs.writeFileSync(NONILION_SCAN_FILE, JSON.stringify(latestSyncedScan), 'utf8');
+    fs.writeFileSync(DEVSETUP_SCAN_FILE, JSON.stringify(latestSyncedScan), 'utf8');
   } catch {
     // ignore read-only fs
   }
@@ -755,15 +833,21 @@ function buildPowerShellSetupScript(
   ];
 
   for (const req of requirements) {
+    const catalogItem = findCatalogItem(req.name);
+    const trustedCommand = catalogItem?.installCommand || '';
     if (req.envStatus === 'installed') {
       lines.push(`Write-Host "[OK] ${req.name} already installed." -ForegroundColor Green`);
       continue;
     }
+    if (!trustedCommand) {
+      lines.push(`Write-Host "[SKIP] ${req.name} is not in the verified software catalog." -ForegroundColor Red`);
+      continue;
+    }
     lines.push(`# ${req.mandatory ? 'Mandatory' : 'Optional'}: ${req.name}`);
-    lines.push(`$ans = Read-Host "Install ${req.name} using '${req.installCommand}'? (Y/n)"`);
+    lines.push(`$ans = Read-Host "Install ${req.name} using '${trustedCommand}'? (Y/n)"`);
     lines.push(`if ($ans -eq "" -or $ans -match "^[Yy]") {`);
     lines.push(`    Write-Host "Installing ${req.name}..." -ForegroundColor Yellow`);
-    lines.push(`    ${req.installCommand}`);
+    lines.push(`    ${trustedCommand}`);
     lines.push(`}`);
     lines.push(``);
   }
@@ -779,583 +863,6 @@ function buildPowerShellSetupScript(
   }
 
   return lines.join('\n');
-}
-
-interface NonilionAgentOutput {
-  markdown: string;
-  voice: string;
-}
-
-async function generateNonilionReply(userMessage: string): Promise<NonilionAgentOutput> {
-  if (!userMessage.trim()) {
-    const msg =
-      'Hi! I am **DevSetup AI**. Tell me what software or project you want to set up (e.g., *"Set up VS Code for C++"* or *"Fix g++ is not recognized"*), and I will inspect your environment, generate a 1-click setup script, and verify it works.';
-    return { markdown: msg, voice: 'DevSetup AI is ready. Tell me what project or error you need help setting up.' };
-  }
-
-  const kbSummary = SOFTWARE_KNOWLEDGE_BASE.map(
-    (item) =>
-      `- **${item.name}** (${item.category}): v${item.recommendedVersion} | \`${item.installCommand}\` | verify=\`${item.verifyCommand}\` | [Official](${item.officialUrl})`
-  ).join('\n');
-
-  const scanContext = latestSyncedScan
-    ? `REAL LOCAL MACHINE SCAN (from user's laptop):\n${JSON.stringify(latestSyncedScan)}`
-    : 'REAL LOCAL MACHINE SCAN: Not yet synced. Mark envStatus as "not_scanned" unless known.';
-
-  try {
-    const response = await generateWithFallback({
-      contents: `User message: ${userMessage}\n\n${scanContext}`,
-      config: {
-        systemInstruction: `You are DevSetup AI inside a Nonilion.com virtual office.
-You MUST NOT act like a generic chatbot. Return structured JSON for one of three modes:
-1. "clarify_or_impossible": If the user's request is too vague (e.g., "set up my laptop") OR impossible (e.g., "install Xcode on Windows" or "install iOS Simulator on Linux"), set mode="clarify_or_impossible", explain clearly what is missing or impossible, and ask 2-3 specific follow-up questions or give the real alternative.
-2. "troubleshoot": If the user shares an error message, stack trace, or asks to fix something broken (e.g., "g++ is not recognized", "ModuleNotFoundError"), set mode="troubleshoot", diagnose the root cause in plain English, give exact approval-gated fix commands, and give a verification command.
-3. "setup": For any valid setup/project request, compare against the REAL LOCAL MACHINE SCAN if provided (never fake installed software!), list mandatory vs optional tools from the Knowledge Base (do NOT suggest downloading a redundant competing tool if an equivalent tool is already installed in the scan, e.g., VS Code already present), provide config steps, and provide a small runnable sample test program.
-
-Knowledge Base:
-${kbSummary}`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            mode: { type: Type.STRING },
-            title: { type: Type.STRING },
-            summary: { type: Type.STRING },
-            voiceSummary: { type: Type.STRING },
-            followUpQuestions: { type: Type.ARRAY, items: { type: Type.STRING } },
-            requirements: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  mandatory: { type: Type.BOOLEAN },
-                  requiredVersion: { type: Type.STRING },
-                  envStatus: { type: Type.STRING },
-                  detectedVersion: { type: Type.STRING },
-                  installCommand: { type: Type.STRING },
-                  verifyCommand: { type: Type.STRING },
-                  officialUrl: { type: Type.STRING },
-                },
-                required: ['name', 'mandatory', 'requiredVersion', 'envStatus', 'installCommand', 'verifyCommand', 'officialUrl'],
-              },
-            },
-            configSteps: { type: Type.ARRAY, items: { type: Type.STRING } },
-            troubleshoot: {
-              type: Type.OBJECT,
-              properties: {
-                classification: { type: Type.STRING },
-                cause: { type: Type.STRING },
-                fixCommands: { type: Type.ARRAY, items: { type: Type.STRING } },
-                verifyCommand: { type: Type.STRING },
-              },
-            },
-            sampleProject: {
-              type: Type.OBJECT,
-              properties: {
-                filename: { type: Type.STRING },
-                language: { type: Type.STRING },
-                code: { type: Type.STRING },
-                runCommand: { type: Type.STRING },
-                expectedOutput: { type: Type.STRING },
-              },
-            },
-          },
-          required: ['mode', 'title', 'summary', 'voiceSummary'],
-        },
-      },
-    });
-
-    const parsed = parseGeneratedJson(response.text) as Record<string, unknown>;
-    const mode = String(parsed.mode || 'setup');
-    const title = String(parsed.title || 'DevSetup AI Report');
-    const summary = String(parsed.summary || '');
-    const voice = String(parsed.voiceSummary || summary || 'DevSetup AI finished your request.');
-
-    if (mode === 'clarify_or_impossible') {
-      const qs = Array.isArray(parsed.followUpQuestions)
-        ? (parsed.followUpQuestions as string[]).map((q, i) => `${i + 1}. ${q}`).join('\n')
-        : '';
-      return {
-        markdown: `## ${title}\n\n${summary}${qs ? `\n\n### Questions to Clarify\n${qs}` : ''}`,
-        voice,
-      };
-    }
-
-    if (mode === 'troubleshoot' && parsed.troubleshoot && typeof parsed.troubleshoot === 'object') {
-      const tr = parsed.troubleshoot as Record<string, unknown>;
-      const cmds = Array.isArray(tr.fixCommands)
-        ? (tr.fixCommands as string[]).map((c) => `- \`${c}\``).join('\n')
-        : '';
-      return {
-        markdown: [
-          `## Troubleshooting: ${title}`,
-          `**Classification:** ${tr.classification || 'Environment Issue'}`,
-          `**Why this happened:** ${tr.cause || summary}`,
-          cmds ? `### Approved Fix Commands\n${cmds}` : '',
-          tr.verifyCommand ? `### Verify Resolution\n\`\`\`powershell\n${tr.verifyCommand}\n\`\`\`` : '',
-        ]
-          .filter(Boolean)
-          .join('\n\n'),
-        voice,
-      };
-    }
-
-    const reqs = Array.isArray(parsed.requirements)
-      ? (parsed.requirements as Array<{
-          name: string;
-          mandatory: boolean;
-          requiredVersion: string;
-          envStatus: string;
-          detectedVersion?: string;
-          installCommand: string;
-          verifyCommand: string;
-          officialUrl: string;
-        }>)
-      : [];
-
-    const sample =
-      parsed.sampleProject && typeof parsed.sampleProject === 'object'
-        ? (parsed.sampleProject as {
-            filename: string;
-            language: string;
-            code: string;
-            runCommand: string;
-            expectedOutput: string;
-          })
-        : undefined;
-
-    const bundleId = `b${Date.now().toString(36)}`;
-    const ps1Content = buildPowerShellSetupScript(title, reqs, sample);
-    const lockContent = JSON.stringify(
-      {
-        project: title,
-        generatedAt: new Date().toISOString(),
-        machineScanned: latestSyncedScan ? latestSyncedScan.hostname : null,
-        requirements: reqs,
-      },
-      null,
-      2
-    );
-
-    const tableRows = reqs
-      .map((r) => {
-        const statusText =
-          r.envStatus === 'installed'
-            ? `Installed (${r.detectedVersion || 'detected'})`
-            : r.envStatus === 'missing'
-            ? 'Missing on PC'
-            : 'Needs Scan / Config';
-        return `| **${r.name}** | ${r.mandatory ? 'Mandatory' : 'Optional'} | ${r.requiredVersion} | ${statusText} | \`${r.installCommand}\` | [Official](${r.officialUrl}) |`;
-      })
-      .join('\n');
-
-    const configSteps = Array.isArray(parsed.configSteps)
-      ? (parsed.configSteps as string[]).map((s, i) => `${i + 1}. ${s}`).join('\n')
-      : '';
-
-    const reportMd = [
-      `# DevSetup AI Setup Report: ${title}`,
-      summary,
-      latestSyncedScan
-        ? `**Scanned Machine:** ${latestSyncedScan.hostname} (${latestSyncedScan.os})`
-        : `**Machine Scan:** Not synced yet (run Local Companion to auto-detect installed tools).`,
-      `## Software Matrix`,
-      `| Software | Priority | Target Version | Local Status | Command | Source |`,
-      `| :--- | :--- | :--- | :--- | :--- | :--- |`,
-      tableRows,
-      configSteps ? `## Configuration Steps\n${configSteps}` : '',
-      sample
-        ? `## Verification Program (${sample.filename})\n\`\`\`${sample.language || 'text'}\n${sample.code}\n\`\`\`\nRun: \`${sample.runCommand}\` → Expected: \`${sample.expectedOutput}\``
-        : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
-
-    const filesMap: Record<string, { content: string; contentType: string }> = {
-      'setup-env.ps1': { content: ps1Content, contentType: 'text/plain' },
-      'devsetup.lock.json': { content: lockContent, contentType: 'application/json' },
-      'setup-report.md': { content: reportMd, contentType: 'text/markdown' },
-    };
-    if (sample?.filename && sample?.code) {
-      filesMap[sample.filename] = { content: sample.code, contentType: 'text/plain' };
-    }
-    generatedArtifacts.set(bundleId, filesMap);
-
-    const appBase = process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL'
-      ? process.env.APP_URL.replace(/\/$/, '')
-      : '';
-    const artifactLinks = appBase
-      ? [
-          `- **1-Click Installer & Verifier Script:** [setup-env.ps1](${appBase}/api/artifacts/${bundleId}/setup-env.ps1)`,
-          `- **Reproducible Lockfile:** [devsetup.lock.json](${appBase}/api/artifacts/${bundleId}/devsetup.lock.json)`,
-          `- **Full Setup Report:** [setup-report.md](${appBase}/api/artifacts/${bundleId}/setup-report.md)`,
-        ].join('\n')
-      : '';
-
-    const scanBanner = latestSyncedScan
-      ? `**Environment Context:** Matched against your real PC scan (**${latestSyncedScan.hostname}** · ${latestSyncedScan.os})`
-      : `**Environment Context:** Local scan not synced yet — showing verified Windows setup plan.`;
-
-    const markdown = [
-      `## ${title}`,
-      `${summary}\n\n${scanBanner}`,
-      tableRows
-        ? `| Software | Priority | Version | Local Status | Command | Source |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n${tableRows}`
-        : '',
-      configSteps ? `### Configuration Steps\n${configSteps}` : '',
-      sample
-        ? `### Verification Test (${sample.filename})\n\`\`\`${sample.language || 'text'}\n${sample.code}\n\`\`\`\n**Run:** \`${sample.runCommand}\` · **Expected:** \`${sample.expectedOutput}\``
-        : '',
-      artifactLinks ? `### Generated Setup Files\n${artifactLinks}` : '',
-      `### Run 1-Click Automated Setup (PowerShell)\n\`\`\`powershell\n${ps1Content.split('\n').slice(0, 18).join('\n')}\n\`\`\``,
-    ]
-      .filter(Boolean)
-      .join('\n\n');
-
-    return { markdown, voice };
-  } catch (err) {
-    console.error('Nonilion webhook Gemini fallback triggered:', err);
-    return {
-      markdown: buildKbFallbackReply(userMessage),
-      voice: 'I generated a setup checklist from the verified software catalog.',
-    };
-  }
-}
-
-async function handleNonilionEvent(event: Record<string, unknown>) {
-  if (event.type === 'test') {
-    return;
-  }
-
-  const directCandidate =
-    event.text ?? event.message ?? event.prompt ?? event.content ?? event.input ?? event.query;
-  const userMessage = typeof directCandidate === 'string' ? directCandidate : '';
-  const result = await generateNonilionReply(userMessage);
-
-  const apiBase = typeof event.api_base === 'string' ? event.api_base : '';
-  const token = process.env.NONILION_BOT_TOKEN;
-  if (!apiBase || !token) return;
-
-  const isPrivate = event.type === 'console_message';
-  const endpoint = `${apiBase}/${isPrivate ? 'inbox' : 'chat'}`;
-  const payload = isPrivate
-    ? { text: result.markdown, reply_to: event.message_id }
-    : { text: result.markdown };
-
-  const resp = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-
-  if (!resp.ok) {
-    console.error('Failed posting reply to Nonilion:', resp.status, await resp.text());
-  }
-
-  // Speak concise summary aloud in the Nonilion virtual office
-  await fetch(`${apiBase}/say`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ text: result.voice }),
-  }).catch(() => {});
-}
-
-const nonilionWebhookHandler: express.RequestHandler = async (req, res) => {
-  const secret = process.env.WEBHOOK_SECRET;
-  if (secret) {
-    const authHeader = req.get('authorization');
-    const customHeader = req.get('x-webhook-secret') || req.get('x-sender-key');
-    if (authHeader !== `Bearer ${secret}` && customHeader !== secret) {
-      res.sendStatus(401);
-      return;
-    }
-  }
-
-  const body = (req.body ?? {}) as Record<string, unknown>;
-
-  if (typeof body.challenge === 'string') {
-    res.json({ ok: true, challenge: body.challenge });
-    return;
-  }
-
-  if (typeof body.api_base === 'string' || typeof body.type === 'string') {
-    res.status(200).json({ ok: true });
-    handleNonilionEvent(body).catch((err) => console.error('Nonilion async handler error:', err));
-    return;
-  }
-
-  const directCandidate =
-    body.message ?? body.text ?? body.prompt ?? body.content ?? body.input ?? body.query;
-  let userMessage = typeof directCandidate === 'string' ? directCandidate : '';
-  if (!userMessage && Array.isArray(body.messages) && body.messages.length > 0) {
-    const last = body.messages[body.messages.length - 1] as Record<string, unknown> | undefined;
-    if (last && typeof last.content === 'string') {
-      userMessage = last.content;
-    }
-  }
-
-  const result = await generateNonilionReply(userMessage);
-  res.json({ ok: true, reply: result.markdown, text: result.markdown, message: result.markdown, content: result.markdown });
-};
-
-app.post('/api/nonilion/webhook', nonilionWebhookHandler);
-app.post('/webhook', nonilionWebhookHandler);
-
-// --- Nonilion Direct Pairing & Polling Bridge (Works inside AI Studio without public webhooks) ---
-const NONILION_DEFAULT_API_BASE = 'https://www.nonilion.com/api/bots/v1';
-const NONILION_SESSION_FILE = path.resolve(process.cwd(), '.nonilion-session.json');
-
-interface NonilionSessionState {
-  token: string;
-  apiBase: string;
-  botName?: string;
-  room?: string;
-}
-
-let nonilionSession: NonilionSessionState | null = null;
-const processedNonilionIds = new Set<string>();
-let nonilionPollTimer: NodeJS.Timeout | null = null;
-let nonilionPollingBusy = false;
-let nonilionStats = {
-  lastPollAt: null as string | null,
-  messagesHandled: 0,
-  lastError: null as string | null,
-};
-
-function loadSavedNonilionSession() {
-  try {
-    if (fs.existsSync(NONILION_SESSION_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(NONILION_SESSION_FILE, 'utf8')) as NonilionSessionState;
-      if (raw?.token) {
-        nonilionSession = {
-          token: raw.token,
-          apiBase: raw.apiBase || NONILION_DEFAULT_API_BASE,
-          botName: raw.botName,
-          room: raw.room,
-        };
-        return;
-      }
-    }
-  } catch {
-    // ignore corrupt local session file
-  }
-  if (process.env.NONILION_BOT_TOKEN && process.env.NONILION_BOT_TOKEN !== 'MY_NONILION_BOT_TOKEN') {
-    nonilionSession = {
-      token: process.env.NONILION_BOT_TOKEN,
-      apiBase: NONILION_DEFAULT_API_BASE,
-    };
-  }
-}
-
-async function pollNonilionInbox() {
-  if (!nonilionSession || nonilionPollingBusy) return;
-  nonilionPollingBusy = true;
-  try {
-    const { token, apiBase } = nonilionSession;
-    const res = await fetch(`${apiBase}/inbox`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    nonilionStats.lastPollAt = new Date().toISOString();
-
-    if (!res.ok) {
-      nonilionStats.lastError = `Inbox poll HTTP ${res.status}`;
-      return;
-    }
-    nonilionStats.lastError = null;
-
-    const data = (await res.json()) as unknown;
-    let items: (Record<string, unknown> & { _channel?: 'inbox' | 'chat' })[] = [];
-    if (Array.isArray(data)) {
-      items = data as Record<string, unknown>[];
-    } else if (data && typeof data === 'object') {
-      const obj = data as Record<string, unknown>;
-      const pendingArr = Array.isArray(obj.pending)
-        ? (obj.pending as Record<string, unknown>[]).map((m) => ({ ...m, _channel: 'inbox' as const }))
-        : null;
-      const mentionsArr = Array.isArray(obj.room_mentions)
-        ? (obj.room_mentions as Record<string, unknown>[]).map((m) => ({ ...m, _channel: 'chat' as const }))
-        : [];
-      if (pendingArr !== null) {
-        items = [...pendingArr, ...mentionsArr];
-      } else {
-        const candidate = obj.messages ?? obj.items ?? obj.events ?? obj.inbox ?? obj.data;
-        if (Array.isArray(candidate)) {
-          items = candidate as Record<string, unknown>[];
-        }
-      }
-    }
-
-    for (const msg of items) {
-      const id = String(msg.id ?? msg.message_id ?? '');
-      if (!id || processedNonilionIds.has(id)) continue;
-
-      if (msg.is_bot === true || msg.from_bot === true || msg.sender_type === 'bot' || msg.role === 'assistant') {
-        processedNonilionIds.add(id);
-        continue;
-      }
-      if (msg.replied === true || msg.handled === true) {
-        processedNonilionIds.add(id);
-        continue;
-      }
-
-      const rawText = msg.text ?? msg.content ?? msg.message ?? msg.body ?? '';
-      const text = typeof rawText === 'string' ? rawText.trim() : '';
-      if (!text) {
-        processedNonilionIds.add(id);
-        continue;
-      }
-
-      processedNonilionIds.add(id);
-      const result = await generateNonilionReply(text);
-
-      const isRoomChat =
-        msg._channel === 'chat' ||
-        msg.type === 'room_mention' ||
-        msg.type === 'chat' ||
-        msg.channel === 'chat';
-      const targetEndpoint = `${apiBase}/${isRoomChat ? 'chat' : 'inbox'}`;
-      const payload = isRoomChat ? { text: result.markdown } : { text: result.markdown, reply_to: id };
-
-      const postRes = await fetch(targetEndpoint, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (postRes.ok) {
-        nonilionStats.messagesHandled += 1;
-        await fetch(`${apiBase}/say`, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ text: result.voice }),
-        }).catch(() => {});
-      } else {
-        nonilionStats.lastError = `Reply failed HTTP ${postRes.status}`;
-      }
-    }
-  } catch (err) {
-    nonilionStats.lastError = err instanceof Error ? err.message : 'Polling error';
-  } finally {
-    nonilionPollingBusy = false;
-  }
-}
-
-function startNonilionPolling() {
-  if (nonilionPollTimer) clearInterval(nonilionPollTimer);
-  if (!nonilionSession) return;
-  pollNonilionInbox().catch(() => {});
-  nonilionPollTimer = setInterval(() => {
-    pollNonilionInbox().catch(() => {});
-  }, 3000);
-}
-
-app.get('/api/nonilion/status', (_req, res) => {
-  res.json({
-    connected: Boolean(nonilionSession?.token),
-    botName: nonilionSession?.botName || 'DevSetup AI',
-    room: nonilionSession?.room || null,
-    lastPollAt: nonilionStats.lastPollAt,
-    messagesHandled: nonilionStats.messagesHandled,
-    lastError: nonilionStats.lastError,
-  });
-});
-
-app.post('/api/nonilion/pair', async (req, res) => {
-  try {
-    const code = typeof req.body?.code === 'string' ? req.body.code.trim().toUpperCase() : '';
-    if (!code) {
-      res.status(400).json({ ok: false, error: 'Enter the 6-character pairing code from Nonilion.' });
-      return;
-    }
-
-    const pairRes = await fetch(`${NONILION_DEFAULT_API_BASE}/pair`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
-    });
-    const pairData = (await pairRes.json()) as Record<string, unknown>;
-
-    if (!pairRes.ok || !pairData.token) {
-      res.status(pairRes.status || 400).json({
-        ok: false,
-        error: String(pairData.error || 'Pairing code invalid or expired. Generate a fresh pairing code in Nonilion.'),
-      });
-      return;
-    }
-
-    const token = String(pairData.token);
-    const apiBase = typeof pairData.api_base === 'string' ? pairData.api_base : NONILION_DEFAULT_API_BASE;
-    let botName = typeof pairData.bot_name === 'string' ? pairData.bot_name : typeof pairData.name === 'string' ? pairData.name : 'DevSetup AI';
-    let room = typeof pairData.room === 'string' ? pairData.room : typeof pairData.room_id === 'string' ? pairData.room_id : undefined;
-
-    try {
-      const meRes = await fetch(`${apiBase}/me`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (meRes.ok) {
-        const me = (await meRes.json()) as Record<string, unknown>;
-        const bot = (me.bot && typeof me.bot === 'object' ? me.bot : me) as Record<string, unknown>;
-        if (typeof bot.name === 'string') botName = bot.name;
-        if (typeof bot.room === 'string') room = bot.room;
-        if (typeof bot.room_id === 'string') room = bot.room_id;
-      }
-    } catch {
-      // optional profile fetch
-    }
-
-    nonilionSession = { token, apiBase, botName, room };
-    try {
-      fs.writeFileSync(NONILION_SESSION_FILE, JSON.stringify(nonilionSession), 'utf8');
-    } catch {
-      // ignore if filesystem is read-only
-    }
-
-    startNonilionPolling();
-
-    res.json({
-      ok: true,
-      connected: true,
-      botName,
-      room: room || null,
-    });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err instanceof Error ? err.message : 'Failed to pair with Nonilion.',
-    });
-  }
-});
-
-app.post('/api/nonilion/disconnect', (_req, res) => {
-  nonilionSession = null;
-  if (nonilionPollTimer) {
-    clearInterval(nonilionPollTimer);
-    nonilionPollTimer = null;
-  }
-  try {
-    if (fs.existsSync(NONILION_SESSION_FILE)) fs.unlinkSync(NONILION_SESSION_FILE);
-  } catch {
-    // ignore
-  }
-  res.json({ ok: true, connected: false });
-});
-
-loadSavedNonilionSession();
-if (nonilionSession) {
-  startNonilionPolling();
 }
 
 async function startServer() {

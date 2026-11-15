@@ -83,7 +83,10 @@ export const TroubleshooterView: React.FC<TroubleshooterViewProps> = ({ localSca
     try {
       const response = await fetch('http://127.0.0.1:4789/execute', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Companion-Token': localStorage.getItem('devsetup_companion_token') || '',
+        },
         body: JSON.stringify({ command }),
       });
       const data = await response.json();
