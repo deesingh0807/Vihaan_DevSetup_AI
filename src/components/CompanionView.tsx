@@ -24,6 +24,10 @@ export const CompanionView: React.FC<CompanionViewProps> = ({
   };
 
   const handleConnectLive = async () => {
+    if (!companionToken.trim()) {
+      setError('Run the downloaded PowerShell script first, then paste the "Companion session token" printed in that PowerShell window.');
+      return;
+    }
     setConnecting(true);
     setError(null);
     setSuccessMsg(null);
@@ -134,6 +138,12 @@ export const CompanionView: React.FC<CompanionViewProps> = ({
             <code className="block font-mono text-slate-900">
               powershell -ExecutionPolicy Bypass -File .\devsetup-companion.ps1
             </code>
+            <div className="pt-2 text-slate-600">
+              1. Open PowerShell in the folder where you downloaded the script.
+              2. Run the command above.
+              3. Copy the value after <code className="font-mono">Companion session token:</code> from that same window.
+              4. Paste it below and keep the PowerShell window open.
+            </div>
           </div>
           <label className="block text-xs text-slate-600">
             Companion token (printed in the PowerShell window)

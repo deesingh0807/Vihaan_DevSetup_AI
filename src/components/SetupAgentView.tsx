@@ -112,16 +112,31 @@ export const SetupAgentView: React.FC<SetupAgentViewProps> = ({
     setSavedSuccess(false);
 
     try {
-      const res = await fetch('/api/agent/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: prompt.trim(),
-          assignmentText: assignmentText.trim() || undefined,
-          assignmentImage: assignmentImage || undefined,
-          localScan: localScan || undefined,
-        }),
+      const requestBody = JSON.stringify({
+        prompt: prompt.trim(),
+        assignmentText: assignmentText.trim() || undefined,
+        assignmentImage: assignmentImage || undefined,
+        localScan: localScan || undefined,
       });
+      let res: Response;
+      try {
+        res = await fetch('/api/agent/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: requestBody,
+        });
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        try {
+          res = await fetch('/api/agent/analyze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: requestBody,
+          });
+        } catch {
+          throw new Error('The local server could not be reached. Start it with "npm run dev", refresh this page, and try again.');
+        }
+      }
       const rawText = await res.text();
       let data: any;
       try {
