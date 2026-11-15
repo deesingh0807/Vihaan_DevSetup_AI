@@ -418,7 +418,10 @@ npm start
 
 ```powershell
 cd "$HOME\Downloads"
-powershell.exe -ExecutionPolicy Bypass -File ".\devsetup-companion.ps1"
+$script = Get-ChildItem ".\devsetup-companion*.ps1" |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+powershell.exe -ExecutionPolicy Bypass -File $script.FullName
 ```
 
 If PowerShell says the file does not exist, replace `$HOME\Downloads` with the
